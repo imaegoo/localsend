@@ -4,7 +4,6 @@ import 'package:dart_mappable/dart_mappable.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
-import 'package:flutter_displaymode/flutter_displaymode.dart';
 import 'package:localsend_app/config/refena.dart';
 import 'package:localsend_app/config/theme.dart';
 import 'package:localsend_app/pages/home_page.dart';
@@ -13,6 +12,7 @@ import 'package:localsend_app/pages/whats_new_page.dart';
 import 'package:localsend_app/provider/animation_provider.dart';
 import 'package:localsend_app/provider/app_arguments_provider.dart';
 import 'package:localsend_app/provider/device_info_provider.dart';
+import 'package:localsend_app/provider/fixed_display_provider.dart';
 import 'package:localsend_app/provider/network/nearby_devices_provider.dart';
 import 'package:localsend_app/provider/network/server/server_provider.dart';
 import 'package:localsend_app/provider/network/webrtc/signaling_provider.dart';
@@ -32,6 +32,7 @@ import 'package:localsend_app/util/native/channel/android_channel.dart';
 import 'package:localsend_app/util/native/context_menu_helper.dart';
 import 'package:localsend_app/util/native/cross_file_converters.dart';
 import 'package:localsend_app/util/native/device_info_helper.dart';
+import 'package:localsend_app/util/native/display_mode_helper.dart';
 import 'package:localsend_app/util/native/exit_helper.dart';
 import 'package:localsend_app/util/native/macos_channel.dart';
 import 'package:localsend_app/util/native/platform_check.dart';
@@ -159,6 +160,7 @@ Future<RefenaContainer> preInit(List<String> args) async {
       deviceRawInfoProvider.overrideWithValue(await getDeviceInfo()),
       appArgumentsProvider.overrideWithValue(args),
       tvProvider.overrideWithValue(await checkIfTv()),
+      fixedDisplayProvider.overrideWithValue(await checkIfFixedDisplay()),
       dynamicColorsProvider.overrideWithValue(dynamicColors),
       sleepProvider.overrideWithInitialState((ref) => startHidden),
     ],
@@ -205,11 +207,12 @@ Future<void> postInit(BuildContext context, Ref ref, bool appStart) async {
   await updateSystemOverlayStyle(context);
 
   if (checkPlatform([TargetPlatform.android])) {
-    // On some TVs, requesting a high refresh rate can trigger HDMI resync and blank the display when entering or leaving the app.
+    // Requesting a display mode reconfigures the panel. On devices with a fixed display (TVs, car head units,
+    // embedded panels) this can blank the screen or leave parts of the UI unpainted.
     // https://github.com/localsend/localsend/issues/3452
-    if (!ref.read(tvProvider)) {
+    if (!skipHighRefreshRate && !ref.read(fixedDisplayProvider)) {
       try {
-        await FlutterDisplayMode.setHighRefreshRate();
+        await applyHighRefreshRate();
       } catch (e) {
         _logger.warning('Setting high refresh rate failed', e);
       }
