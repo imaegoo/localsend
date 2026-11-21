@@ -38,6 +38,9 @@ enum RailDiagMode {
 /// The currently selected rail layout.
 final railDiagMode = ValueNotifier<RailDiagMode>(RailDiagMode.baseline);
 
+/// A colour that is impossible to miss, to tell "not painted" apart from "painted in the wrong colour".
+const railDiagDebugColor = Color(0xFFFF00FF);
+
 /// A hand written rail that uses neither [NavigationRail] nor [Material].
 ///
 /// If this one is painted while [NavigationRail] is not, the problem is inside the framework widget
@@ -55,7 +58,7 @@ class RailDiagCustomRail extends StatelessWidget {
     final foreground = debugColors ? Colors.red : Colors.white;
     return Container(
       width: 256,
-      color: debugColors ? Colors.magenta : const Color(0xFF141F1C),
+      color: debugColors ? railDiagDebugColor : const Color(0xFF141F1C),
       child: SafeArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,

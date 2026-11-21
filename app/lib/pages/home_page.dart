@@ -1,4 +1,4 @@
-import 'dart:io';
+﻿import 'dart:io';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
@@ -171,7 +171,7 @@ class _HomePageState extends State<HomePage> with Refena {
         selectedIndex: vm.currentTab.index,
         onDestinationSelected: (index) => vm.changeTab(HomeTab.values[index]),
         extended: extended,
-        backgroundColor: debugColors ? Colors.magenta : Theme.of(context).cardColorWithElevation,
+        backgroundColor: debugColors ? railDiagDebugColor : Theme.of(context).cardColorWithElevation,
         leading: extended
             ? const Column(
                 children: [
