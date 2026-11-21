@@ -6,6 +6,7 @@
 - fix(macos): file sharing via Share Extension doesn't work in DMG builds (@ShlomoCode, @vdmkotai)
 - fix: show the real error when a file cannot be read while sending, instead of transferring it as an empty file (@leopalmieri-spec)
 - fix: show the actual save location path for receiving files (@ShlomoCode)
+- fix(android): do not request a display mode on devices with a fixed display (TVs, car head units), which could blank the screen or leave the navigation rail unpainted
 
 ## 1.18.2 (2026-08-21)
 
