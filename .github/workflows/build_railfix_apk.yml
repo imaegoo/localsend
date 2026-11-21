@@ -1,8 +1,8 @@
 name: Build RailFix APK
 
-# Builds a self-signed test APK for verifying the "blank navigation rail on car head units" fix.
+# Builds self-signed test APKs for verifying the "blank navigation rail on car head units" fix.
 # Everything is signed with a throwaway key generated in the workflow, so no repository secrets are needed.
-# The APK installs next to the official LocalSend (different applicationId and label).
+# The APKs install next to the official LocalSend (different applicationId and label).
 
 on:
   workflow_dispatch:
@@ -16,50 +16,33 @@ permissions:
 env:
   FLUTTER_VERSION: "3.41.9"
   APK_BUILD_DIR: "/tmp/build"
-  APP_ID_SUFFIX: ".railfix"
-  APP_LABEL: "LocalSend RailFix"
 
 jobs:
   build_apk:
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # A: never requests a display mode at all. Proves whether the display mode request is the cause.
+          - variant: bypass
+            suffix: ".railfixa"
+            label: "LocalSend A (bypass)"
+            dart_define: "--dart-define=localsend.skipHighRefreshRate=true"
+          # B: the exact logic of the proposed fix. Works only if the device is detected as a fixed display.
+          - variant: patch
+            suffix: ".railfixb"
+            label: "LocalSend B (patch)"
+            dart_define: ""
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Remove proprietary dependencies
-        run: sh support/scripts/remove_proprietary_dependencies.sh
-
       - name: Copy files to env.APK_BUILD_DIR
         run: |
           mkdir -p $APK_BUILD_DIR
           cp -r . $APK_BUILD_DIR
-
-      # Makes the test build installable next to the official app, so both can be compared on the device.
-      - name: Apply test build identity
-        working-directory: ${{ env.APK_BUILD_DIR }}
-        run: |
-          sed -i 's|applicationId "org.localsend.localsend_app"|applicationId "org.localsend.localsend_app'"$APP_ID_SUFFIX"'"|' app/android/app/build.gradle
-          sed -i 's|android:label="LocalSend"|android:label="'"$APP_LABEL"'"|' app/android/app/src/main/AndroidManifest.xml
-          grep -n 'applicationId ' app/android/app/build.gradle
-          grep -n 'android:label=' app/android/app/src/main/AndroidManifest.xml
-
-      - name: Generate throwaway signing key
-        working-directory: ${{ env.APK_BUILD_DIR }}
-        run: |
-          keytool -genkeypair -v \
-            -keystore "$PWD/railfix.jks" \
-            -storetype PKCS12 \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -alias railfix \
-            -storepass railfix123 -keypass railfix123 \
-            -dname "CN=LocalSend RailFix Test, OU=RailFix, O=LocalSend, L=Test, ST=Test, C=DE"
-          cat > app/android/key.properties <<EOF
-          storePassword=railfix123
-          keyPassword=railfix123
-          keyAlias=railfix
-          storeFile=$PWD/railfix.jks
-          EOF
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -82,9 +65,9 @@ jobs:
         working-directory: ${{ env.APK_BUILD_DIR }}/app
         run: flutter pub get
 
+      # Runs before the FOSS stripping, which leaves an unused import behind in a file this fix does not touch.
       - name: Analyze
         working-directory: ${{ env.APK_BUILD_DIR }}/app
-        continue-on-error: true
         run: flutter analyze
 
       - name: Test
@@ -93,32 +76,81 @@ jobs:
           flutter test test/unit/provider/fixed_display_provider_test.dart
           flutter test test/unit/util/native/display_mode_helper_test.dart
 
-      # The display mode request is skipped unconditionally here, so the hypothesis can be verified even on
-      # devices that do not report a fixed-display system feature.
+      - name: Remove proprietary dependencies
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: sh support/scripts/remove_proprietary_dependencies.sh
+
+      # Makes the test build installable next to the official app, so both can be compared on the device.
+      - name: Apply test build identity
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          sed -i 's|applicationId "org.localsend.localsend_app"|applicationId "org.localsend.localsend_app'"${{ matrix.suffix }}"'"|' app/android/app/build.gradle
+          sed -i 's|android:label="LocalSend"|android:label="${{ matrix.label }}"|' app/android/app/src/main/AndroidManifest.xml
+          grep -n 'applicationId ' app/android/app/build.gradle
+          grep -n 'android:label=' app/android/app/src/main/AndroidManifest.xml
+
+      - name: Generate throwaway signing key
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$PWD/railfix.jks" \
+            -storetype PKCS12 \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias railfix \
+            -storepass railfix123 -keypass railfix123 \
+            -dname "CN=LocalSend RailFix Test, OU=RailFix, O=LocalSend, L=Test, ST=Test, C=DE"
+          cat > app/android/key.properties <<EOF
+          storePassword=railfix123
+          keyPassword=railfix123
+          keyAlias=railfix
+          storeFile=$PWD/railfix.jks
+          EOF
+
       - name: Build APK
         working-directory: ${{ env.APK_BUILD_DIR }}/app
-        run: flutter build apk --split-per-abi --dart-define=localsend.skipHighRefreshRate=true
+        run: flutter build apk --split-per-abi ${{ matrix.dart_define }}
 
       - name: Collect APKs
         run: |
           mkdir -p apk-out
-          cp $APK_BUILD_DIR/app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk apk-out/LocalSend-RailFix-arm64-v8a.apk
-          cp $APK_BUILD_DIR/app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk apk-out/LocalSend-RailFix-armeabi-v7a.apk
+          cp $APK_BUILD_DIR/app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "apk-out/RailFix-${{ matrix.variant }}-arm64-v8a.apk"
+          cp $APK_BUILD_DIR/app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk "apk-out/RailFix-${{ matrix.variant }}-armeabi-v7a.apk"
           ls -l apk-out
 
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: railfix-apk
+          name: railfix-apk-${{ matrix.variant }}
           path: apk-out/*.apk
 
-      - name: Publish APK to a release
+      - name: Save APKs for the release job
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-apk-${{ matrix.variant }}
+          path: apk-out/*.apk
+
+  publish:
+    needs: build_apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-apk-*
+          path: apk-out
+          merge-multiple: true
+
+      - name: Publish APKs to a release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          ls -l apk-out
           TAG="railfix-run-${{ github.run_number }}"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "RailFix test build ${{ github.run_number }}" \
-            --notes "Self-signed test build of the navigation rail fix, with the display mode request skipped unconditionally (--dart-define=localsend.skipHighRefreshRate=true). Installs next to the official app as \"$APP_LABEL\"." \
+            --notes "Self-signed test builds of the navigation rail fix. They install next to the official app.
+
+          **A (bypass)** — never requests a display mode. Use this first: if the rail appears, the display mode request is the cause.
+          **B (patch)** — the proposed fix as written: skips the request only on devices detected as a fixed display (leanback / automotive / embedded), and never re-requests the mode that is already active. If B does not fix it but A does, the detection heuristic needs to change before opening a PR." \
             apk-out/*.apk
