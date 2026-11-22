@@ -68,6 +68,17 @@ jobs:
         working-directory: ${{ env.APK_BUILD_DIR }}/app
         run: flutter analyze
 
+      - name: Assert no source change was made
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          # App code must be byte identical to main. This runs before the FOSS stripping, which intentionally
+          # rewrites app/lib, and before the build identity edits, which only touch gradle and the manifest.
+          if ! git diff --quiet -- app/lib; then
+            git diff --stat -- app/lib
+            echo "::error::app/lib differs from main, this is not a control build"; exit 1
+          fi
+          echo "app/lib is identical to main"
+
       - name: Remove proprietary dependencies
         working-directory: ${{ env.APK_BUILD_DIR }}
         run: sh support/scripts/remove_proprietary_dependencies.sh
@@ -80,15 +91,6 @@ jobs:
           sed -i 's|android:label="LocalSend"|android:label="LS CONTROL (no change)"|' app/android/app/src/main/AndroidManifest.xml
           grep -n 'applicationId ' app/android/app/build.gradle
           grep -n 'android:label=' app/android/app/src/main/AndroidManifest.xml
-
-      - name: Assert no source change was made
-        working-directory: ${{ env.APK_BUILD_DIR }}
-        run: |
-          # App code must be byte identical to main — only the build identity above may differ.
-          git diff --stat -- app/lib app/android/app/src/main/kotlin || true
-          if ! git diff --quiet -- app/lib; then
-            echo "::error::app/lib differs from main, this is not a control build"; exit 1
-          fi
 
       - name: Generate throwaway signing key
         working-directory: ${{ env.APK_BUILD_DIR }}
