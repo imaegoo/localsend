@@ -86,46 +86,9 @@ jobs:
         run: |
           git fetch -q fork diag/rail
           git checkout fork/diag/rail -- app/lib/util/ui/rail_diagnostics.dart
-          python3 - <<'PY'
-          import pathlib
-          path = pathlib.Path("app/lib/pages/home_page.dart")
-          text = path.read_text()
-
-          # Import the overlay.
-          anchor = "import 'package:localsend_app/util/native/cross_file_converters.dart';\n"
-          assert anchor in text, "import anchor missing"
-          text = text.replace(
-              anchor,
-              anchor + "import 'package:localsend_app/util/ui/rail_diagnostics.dart';\n",
-              1,
-          )
-
-          # Insert the overlay as the last child of the existing Stack inside the content pane.
-          marker = """                        if (_dragAndDropIndicator)
-                          Container(
-                            width: double.infinity,
-                            decoration: BoxDecoration(
-                              color: Theme.of(context).scaffoldBackgroundColor,
-                            ),
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                const Icon(Icons.file_download, size: 128),
-                                const SizedBox(height: 30),
-                                Text(t.sendTab.placeItems, style: Theme.of(context).textTheme.titleLarge),
-                              ],
-                            ),
-                          ),
-"""
-          assert marker in text, "stack marker missing"
-          text = text.replace(
-              marker,
-              marker + "                        if (railDiagnosticsEnabled) const RailDiagPanel(),\n",
-              1,
-          )
-          path.write_text(text)
-          print("overlay inserted")
-          PY
+          # A separate script file, because an inline heredoc with nested quotes breaks the YAML.
+          python3 support/scripts/railbisect_b2_overlay.py
+          grep -n 'rail_diagnostics.dart\|RailDiagPanel' app/lib/pages/home_page.dart
 
       - name: Force the collapsed rail (b3 only)
         if: matrix.variant == 'b3-extended-off'
