@@ -76,16 +76,16 @@ jobs:
         if: matrix.variant == 'b1-structure'
         working-directory: ${{ env.APK_BUILD_DIR }}
         run: |
-          git fetch -q fork diag/rail
-          git checkout fork/diag/rail -- app/lib/pages/home_page.dart app/lib/util/ui/rail_diagnostics.dart
+          git fetch -q origin diag/rail
+          git checkout FETCH_HEAD -- app/lib/pages/home_page.dart app/lib/util/ui/rail_diagnostics.dart
           grep -c "railDiagnosticsEnabled" app/lib/pages/home_page.dart
 
       - name: Apply the overlay to the original tree (b2 only)
         if: matrix.variant == 'b2-panel'
         working-directory: ${{ env.APK_BUILD_DIR }}
         run: |
-          git fetch -q fork diag/rail
-          git checkout fork/diag/rail -- app/lib/util/ui/rail_diagnostics.dart
+          git fetch -q origin diag/rail
+          git checkout FETCH_HEAD -- app/lib/util/ui/rail_diagnostics.dart
           # A separate script file, because an inline heredoc with nested quotes breaks the YAML.
           python3 support/scripts/railbisect_b2_overlay.py
           grep -n 'rail_diagnostics.dart\|RailDiagPanel' app/lib/pages/home_page.dart
