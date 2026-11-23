@@ -64,6 +64,16 @@ class _HomePageState extends State<HomePage> with Refena {
       ref.redux(homePageControllerProvider).dispatch(ChangeTabAction(widget.initialTab));
       await postInit(context, ref, widget.appStart);
     });
+
+    // On some Android head units the navigation rail reserves its layout space and stays tappable but is
+    // never painted, while the rest of the UI is fine. The rail is laid out in the first frame, before the
+    // async bootstrap above has populated anything it depends on, and nothing requests another paint of that
+    // subtree afterwards, so it stays blank. Rebuilding once after the first frame paints it.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   @override
