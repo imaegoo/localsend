@@ -1,4 +1,4 @@
-﻿name: Build RailBisect APK
+name: Build RailBisect APK
 
 # Bisects the one remaining unknown for the "blank navigation rail on car head units" bug.
 #
