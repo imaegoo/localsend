@@ -1,0 +1,173 @@
+name: Build RailProbe APK
+
+# Turns the bisect result into a candidate fix for the "blank navigation rail on car head units" bug.
+#
+# Bisect results, all installed on the same device, all built with the official flags:
+#
+#   official 643 / RailFix A+B / RailControl / RailNudge   main tree, no extra widget    rail blank
+#   B1  the diagnostics rewrite, overlay switched off      rewritten tree, no widget    rail blank
+#   B3  the original tree, rail forced to collapsed        original tree, no widget     rail blank
+#   B2  the original tree plus one overlay widget          original tree + 1 widget     rail visible
+#
+# So neither the rewritten widget tree nor the rail's collapsed form is the fix: the single extra widget in the
+# content pane is. B2 also stayed correct while cycling through all five rail layouts, so it is not about which
+# widget is there, only that its first frame causes the framework to paint again.
+#
+# This workflow tests two minimal ways of doing that, from the unmodified tree:
+#
+#   c1-markneeds  RenderView.markNeedsPaint() once after the first frame   (5 lines, no visible UI)
+#   c2-overlay    a plain static Material overlay in the corner          (control: known to work)
+#
+# Only arm64-v8a is built, because the 32-bit APK cannot be installed on the affected device.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diag/probe
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.41.9"
+  APK_BUILD_DIR: "/tmp/build"
+
+jobs:
+  build_apk:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: c1-markneeds
+            suffix: ".railprobe1"
+            label: "LS C1 repaint"
+          - variant: c2-overlay
+            suffix: ".railprobe2"
+            label: "LS C2 overlay"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Copy files to env.APK_BUILD_DIR
+        run: |
+          mkdir -p $APK_BUILD_DIR
+          cp -r . $APK_BUILD_DIR
+
+      - name: Apply the probe patch
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          python3 support/scripts/railprobe_patch.py ${{ matrix.variant }}
+          git diff --stat -- app/lib
+          # Fail loudly if the patch did not apply, instead of shipping an unmodified build again.
+          test -f app/lib/util/ui/rail_probe.dart
+          grep -q 'RailProbe' app/lib/pages/home_page.dart
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Rust toolchain
+        working-directory: ${{ env.APK_BUILD_DIR }}/packages/localsend_isolates
+        run: |
+          rustup toolchain install --profile minimal
+          rustup show
+
+      - name: Dependencies
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter analyze
+
+      - name: Remove proprietary dependencies
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: sh support/scripts/remove_proprietary_dependencies.sh
+
+      - name: Apply test build identity
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          sed -i 's|applicationId "org.localsend.localsend_app"|applicationId "org.localsend.localsend_app'"${{ matrix.suffix }}"'"|' app/android/app/build.gradle
+          sed -i 's|android:label="LocalSend"|android:label="${{ matrix.label }}"|' app/android/app/src/main/AndroidManifest.xml
+          grep -n 'applicationId ' app/android/app/build.gradle
+          grep -n 'android:label=' app/android/app/src/main/AndroidManifest.xml
+
+      - name: Generate throwaway signing key
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$PWD/railprobe.jks" \
+            -storetype PKCS12 \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias railprobe \
+            -storepass railprobe123 -keypass railprobe123 \
+            -dname "CN=LocalSend RailProbe Test, OU=RailProbe, O=LocalSend, L=Test, ST=Test, C=DE"
+          cat > app/android/key.properties <<EOF
+          storePassword=railprobe123
+          keyPassword=railprobe123
+          keyAlias=railprobe
+          storeFile=$PWD/railprobe.jks
+          EOF
+
+      # Same flags as the official build, which reproduces the bug.
+      - name: Build APK
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter build apk --split-per-abi
+
+      - name: Collect APK
+        run: |
+          mkdir -p apk-out
+          cp $APK_BUILD_DIR/app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+             "apk-out/RailProbe-${{ matrix.variant }}-arm64-v8a.apk"
+          ls -l apk-out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: railprobe-apk-${{ matrix.variant }}
+          path: apk-out/*.apk
+
+      - name: Save APK for the release job
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-apk-${{ matrix.variant }}
+          path: apk-out/*.apk
+
+  publish:
+    needs: build_apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-apk-*
+          path: apk-out
+          merge-multiple: true
+
+      - name: Publish APKs to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l apk-out
+          TAG="railprobe-run-${{ github.run_number }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RailProbe build ${{ github.run_number }}" \
+            --notes "Candidate fixes for the blank navigation rail, built from the unmodified tree with the official build flags.
+
+          **C1 repaint** - calls RenderView.markNeedsPaint() once after the first frame. No visible UI, about 5 lines.
+          **C2 overlay** - adds a small static overlay in the corner. This is the arrangement that is already known to work and serves as the control.
+
+          If C1 shows the rail, C1 is the fix to propose upstream.
+          If only C2 shows it, the repaint has to be triggered differently." \
+            apk-out/*.apk
