@@ -1,0 +1,223 @@
+name: Build RailProbe APK
+
+# Final narrowing of the fix for the "blank navigation rail on car head units" bug.
+#
+# Every build below was installed on the affected device and built with the official flags:
+#
+#   official 643 / RailFix A+B / RailControl     unmodified                          rail blank
+#   RailNudge                                    setState after the first frame       rail blank
+#   B1 / B3                                      no extra widget in the content Stack rail blank
+#   C1                                           RenderView.markNeedsPaint()          rail blank
+#   D1 / D2                                      RepaintBoundary around rail / body   rail blank
+#   D3                                           invisible overlay (Opacity 0)        rail blank
+#   B2 / C2 / D4                                 one visible overlay in the Stack     rail visible
+#
+# A RepaintBoundary does not help and neither does an overlay that paints nothing: D3 used Opacity(0), which
+# makes RenderOpacity skip painting entirely. Every working build, by contrast, paints opaque pixels.
+#
+# This round separates "paints pixels" from "is visible", and also isolates the one rendering switch that was
+# never actually tested: the three early builds all had the diagnostics overlay enabled by default, so their rail
+# worked no matter what the switch did.
+#
+#   e1-tint      full size overlay at 1% opacity        paints, invisible
+#   e2-pixel     one 1x1 opaque pixel in the corner     paints, invisible
+#   e3-control   the visible overlay that works         control for the harness
+#   e4-impeller  unmodified Dart, Impeller disabled     the untested rendering switch
+#
+# Only arm64-v8a is built, because the 32-bit APK cannot be installed on the affected device.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diag/probe3
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.41.9"
+  APK_BUILD_DIR: "/tmp/build"
+
+jobs:
+  build_apk:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: e1-tint
+            suffix: ".railprobe21"
+            label: "LS E1 tint"
+            meta_key: ""
+            meta_value: ""
+          - variant: e2-pixel
+            suffix: ".railprobe22"
+            label: "LS E2 pixel"
+            meta_key: ""
+            meta_value: ""
+          - variant: e3-control
+            suffix: ".railprobe23"
+            label: "LS E3 control"
+            meta_key: ""
+            meta_value: ""
+          - variant: e4-impeller
+            suffix: ".railprobe24"
+            label: "LS E4 no impeller"
+            meta_key: "io.flutter.embedding.android.EnableImpeller"
+            meta_value: "false"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Copy files to env.APK_BUILD_DIR
+        run: |
+          mkdir -p $APK_BUILD_DIR
+          cp -r . $APK_BUILD_DIR
+
+      - name: Apply the probe patch
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          python3 support/scripts/railprobe_patch.py ${{ matrix.variant }}
+          git diff --stat -- app/lib || true
+          # The three Dart variants must change home_page.dart; e4 must not.
+          if [ "${{ matrix.variant }}" = "e4-impeller" ]; then
+            if ! git diff --quiet -- app/lib; then
+              echo "::error::e4 must not change app/lib"; exit 1
+            fi
+          else
+            if git diff --quiet -- app/lib/pages/home_page.dart; then
+              echo "::error::home_page.dart was not patched"; exit 1
+            fi
+          fi
+
+      - name: Apply the rendering switch
+        if: matrix.meta_key != ''
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        env:
+          META_KEY: ${{ matrix.meta_key }}
+          META_VALUE: ${{ matrix.meta_value }}
+        run: |
+          MANIFEST=app/android/app/src/main/AndroidManifest.xml
+          sed -i "s|^    </application>|        <meta-data android:name=\"$META_KEY\" android:value=\"$META_VALUE\" />\n    </application>|" "$MANIFEST"
+          grep -n "$META_KEY" "$MANIFEST"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Rust toolchain
+        working-directory: ${{ env.APK_BUILD_DIR }}/packages/localsend_isolates
+        run: |
+          rustup toolchain install --profile minimal
+          rustup show
+
+      - name: Dependencies
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter analyze
+
+      - name: Remove proprietary dependencies
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: sh support/scripts/remove_proprietary_dependencies.sh
+
+      - name: Apply test build identity
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          sed -i 's|applicationId "org.localsend.localsend_app"|applicationId "org.localsend.localsend_app'"${{ matrix.suffix }}"'"|' app/android/app/build.gradle
+          sed -i 's|android:label="LocalSend"|android:label="${{ matrix.label }}"|' app/android/app/src/main/AndroidManifest.xml
+          grep -n 'applicationId ' app/android/app/build.gradle
+          grep -n 'android:label=' app/android/app/src/main/AndroidManifest.xml
+
+      - name: Generate throwaway signing key
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$PWD/railprobe.jks" \
+            -storetype PKCS12 \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias railprobe \
+            -storepass railprobe123 -keypass railprobe123 \
+            -dname "CN=LocalSend RailProbe Test, OU=RailProbe, O=LocalSend, L=Test, ST=Test, C=DE"
+          cat > app/android/key.properties <<EOF
+          storePassword=railprobe123
+          keyPassword=railprobe123
+          keyAlias=railprobe
+          storeFile=$PWD/railprobe.jks
+          EOF
+
+      # Same flags as the official build, which reproduces the bug.
+      - name: Build APK
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter build apk --split-per-abi
+
+      - name: Verify the switch is in the manifest
+        if: matrix.meta_key != ''
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)
+          APK=app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i "${{ matrix.meta_key }}" || {
+            echo "::error::rendering switch missing from the manifest"; exit 1; }
+
+      - name: Collect APK
+        run: |
+          mkdir -p apk-out
+          cp $APK_BUILD_DIR/app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+             "apk-out/RailProbe-${{ matrix.variant }}-arm64-v8a.apk"
+          ls -l apk-out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: railprobe-apk-${{ matrix.variant }}
+          path: apk-out/*.apk
+
+      - name: Save APK for the release job
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-apk-${{ matrix.variant }}
+          path: apk-out/*.apk
+
+  publish:
+    needs: build_apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-apk-*
+          path: apk-out
+          merge-multiple: true
+
+      - name: Publish APKs to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l apk-out
+          TAG="railprobe3-run-${{ github.run_number }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RailProbe build ${{ github.run_number }} (first painted pixel)" \
+            --notes "Narrows the blank navigation rail fix down to what actually matters.
+
+          A RepaintBoundary does not help, and neither does an overlay that paints nothing: every working build painted opaque pixels, every failing build did not.
+
+          **E1 tint** - full size overlay at 1% opacity, paints but invisible.
+          **E2 pixel** - a single 1x1 opaque pixel in the corner, invisible.
+          **E3 control** - the visible overlay that works.
+          **E4 no impeller** - unmodified Dart with Impeller disabled; the one switch that was never isolated, because the early builds had a diagnostics overlay enabled by default.
+
+          If E1 or E2 shows the rail, the minimal fix is a single painted pixel rather than a visible panel." \
+            apk-out/*.apk

@@ -1,14 +1,24 @@
 """Applies a RailProbe variant to the checked-out app.
 
-All variants try to make the navigation rail paint, without adding anything visible. The working reference is a
-static Material overlay in the content pane (variant c2-overlay in the previous round): it never rebuilds, yet
-the rail appears and stays. That points at layer composition rather than repaint timing. Marking the RenderView
-as needing paint does not help, because that flag does not reach descendants that own a layer.
+Findings so far (all installed on the affected device, all built with the official flags):
 
-    d1-rail-layer    puts the rail behind its own RepaintBoundary
-    d2-body-layer    puts the whole Scaffold body behind its own RepaintBoundary
-    d3-invisible     adds an invisible, full size composited child to the content stack
-    d4-control       adds the visible overlay that is known to work (the control)
+    official 643 / RailFix A+B / RailControl      unmodified                         rail blank
+    RailNudge                                     setState after first frame          rail blank
+    B1 / B3                                       no extra widget in the Stack        rail blank
+    B2 / C2 / D4                                  one visible overlay in the Stack    rail visible
+    C1                                            RenderView.markNeedsPaint()         rail blank
+    D1 / D2                                       RepaintBoundary around rail/body    rail blank
+    D3                                            invisible overlay (Opacity 0)       rail blank
+
+So a RepaintBoundary is not enough (D1, D2) and an overlay that paints nothing is not enough (D3). The working
+overlays all paint opaque pixels. This round separates "paints pixels" from "is visible", and also tests the one
+rendering switch that was never isolated (all three early builds had the diagnostics overlay on by default, so
+their rail worked regardless of the switch).
+
+    e1-tint      full size overlay at 1% opacity (paints, invisible)
+    e2-pixel     a single 1x1 opaque pixel in the corner (paints, invisible)
+    e3-control   the visible overlay that already works
+    e4-impeller  unmodified Dart, Impeller disabled in the manifest
 
 Usage: python3 support/scripts/railprobe_patch.py <variant>
 """
@@ -18,23 +28,13 @@ import shutil
 import sys
 
 VARIANTS = {
-    "d1-rail-layer": "rail_probe_markneeds.dart",
-    "d2-body-layer": "rail_probe_markneeds.dart",
-    "d3-invisible": "rail_probe_invisible.dart",
-    "d4-control": "rail_probe_overlay.dart",
+    "e1-tint": "rail_probe_tint.dart",
+    "e2-pixel": "rail_probe_pixel.dart",
+    "e3-control": "rail_probe_overlay.dart",
+    "e4-impeller": None,
 }
 
 HOME = pathlib.Path("app/lib/pages/home_page.dart")
-
-RAIL_OPEN = "                if (!sizingInformation.isMobile)\n                  NavigationRail(\n"
-RAIL_CLOSE = "                  ),\n                Expanded(\n"
-RAIL_OPEN_WRAPPED = "                if (!sizingInformation.isMobile)\n                  RepaintBoundary(\n                  child: NavigationRail(\n"
-RAIL_CLOSE_WRAPPED = "                  ),\n                  ),\n                Expanded(\n"
-
-BODY_OPEN = "            body: Row(\n"
-BODY_CLOSE = "            ),\n            bottomNavigationBar:"
-BODY_OPEN_WRAPPED = "            body: RepaintBoundary(\n            child: Row(\n"
-BODY_CLOSE_WRAPPED = "            ),\n            ),\n            bottomNavigationBar:"
 
 STACK_MARKER = (
     "                        if (_dragAndDropIndicator)\n"
@@ -70,24 +70,22 @@ def main() -> int:
         return 2
 
     variant = sys.argv[1]
+    impl_name = VARIANTS[variant]
+
+    # e4 only changes the manifest, which the workflow does itself.
+    if impl_name is None:
+        print(f"{variant} needs no Dart patch")
+        return 0
+
     ui_dir = pathlib.Path("app/lib/util/ui")
-    impl = ui_dir / VARIANTS[variant]
+    impl = ui_dir / impl_name
     if not impl.exists():
         raise SystemExit(f"missing implementation file {impl}")
+    shutil.copyfile(impl, ui_dir / "rail_probe.dart")
 
     text = HOME.read_bytes().decode("utf-8")
-
-    if variant == "d1-rail-layer":
-        text = replace_once(text, RAIL_OPEN, RAIL_OPEN_WRAPPED, "rail open")
-        text = replace_once(text, RAIL_CLOSE, RAIL_CLOSE_WRAPPED, "rail close")
-    elif variant == "d2-body-layer":
-        text = replace_once(text, BODY_OPEN, BODY_OPEN_WRAPPED, "body open")
-        text = replace_once(text, BODY_CLOSE, BODY_CLOSE_WRAPPED, "body close")
-    elif variant in ("d3-invisible", "d4-control"):
-        shutil.copyfile(impl, ui_dir / "rail_probe.dart")
-        text = replace_once(text, IMPORT_ANCHOR, IMPORT_ANCHOR + PROBE_IMPORT, "import")
-        text = replace_once(text, STACK_MARKER, STACK_MARKER + "                        const RailProbe(),\n", "stack")
-
+    text = replace_once(text, IMPORT_ANCHOR, IMPORT_ANCHOR + PROBE_IMPORT, "import")
+    text = replace_once(text, STACK_MARKER, STACK_MARKER + "                        const RailProbe(),\n", "stack")
     HOME.write_bytes(text.encode("utf-8"))
     print(f"patched for {variant}")
     return 0
