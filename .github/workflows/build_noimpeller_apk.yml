@@ -1,0 +1,159 @@
+name: Build NoImpeller APK
+
+# Builds a single APK from the latest upstream main that is identical to the official build except for three
+# things: Impeller is disabled globally, the applicationId has a suffix, and the APK is signed with a throwaway
+# key instead of the release key.
+#
+# The app label stays "LocalSend" and the build steps mirror .github/workflows/build_android_apk.yml (JDK 21,
+# Flutter 3.41.9, FOSS stripping, `flutter build apk --split-per-abi`), so the only functional difference to the
+# official APK is `io.flutter.embedding.android.EnableImpeller=false`.
+#
+# Why: on some Android head units (BYD) the navigation rail is laid out and receives taps but is never painted,
+# while the content pane renders fine. Disabling Impeller makes it appear, and the rail then stays correct. See the
+# issue for the full investigation.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/no-impeller
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.41.9"
+  APK_BUILD_DIR: "/tmp/build"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Get version from pubspec.yaml
+        id: get_version
+        run: |
+          VERSION=$(sed -n 's/^version: \([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' app/pubspec.yaml)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  build_apk:
+    needs: build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # Same order as the official workflow.
+      - name: Remove proprietary dependencies
+        run: sh support/scripts/remove_proprietary_dependencies.sh
+
+      - name: Copy files to env.APK_BUILD_DIR
+        run: |
+          mkdir -p $APK_BUILD_DIR
+          cp -r . $APK_BUILD_DIR
+
+      - name: Disable Impeller and set the applicationId suffix
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          MANIFEST=app/android/app/src/main/AndroidManifest.xml
+          sed -i 's|^    </application>|        <meta-data android:name="io.flutter.embedding.android.EnableImpeller" android:value="false" />\n    </application>|' "$MANIFEST"
+          grep -n 'EnableImpeller' "$MANIFEST"
+
+          # Only the applicationId changes; the label stays "LocalSend".
+          sed -i 's|applicationId "org.localsend.localsend_app"|applicationId "org.localsend.localsend_app.noimpeller"|' app/android/app/build.gradle
+          grep -n 'applicationId ' app/android/app/build.gradle
+          grep -n 'android:label=' "$MANIFEST"
+
+      # The official workflow decodes the release keystore here; this build uses a throwaway key instead.
+      - name: Generate throwaway signing key
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$PWD/noimpeller.jks" \
+            -storetype PKCS12 \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias noimpeller \
+            -storepass noimpeller123 -keypass noimpeller123 \
+            -dname "CN=LocalSend NoImpeller Test, OU=NoImpeller, O=LocalSend, L=Test, ST=Test, C=DE"
+          cat > app/android/key.properties <<EOF
+          storePassword=noimpeller123
+          keyPassword=noimpeller123
+          keyAlias=noimpeller
+          storeFile=$PWD/noimpeller.jks
+          EOF
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Check rust-toolchain.toml
+        working-directory: ${{ env.APK_BUILD_DIR }}/packages/localsend_isolates
+        run: rustup show
+
+      - name: Dependencies
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter analyze
+
+      - name: Build APK
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter build apk --split-per-abi
+
+      - name: Verify the switch and the identity in the APK
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)
+          APK=app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i 'EnableImpeller' || {
+            echo "::error::EnableImpeller is missing from the manifest"; exit 1; }
+          "$BT/aapt2" dump badging "$APK" | grep -E "^package:|^application-label:" || true
+
+      - name: Collect APK
+        run: |
+          mkdir -p apk-out
+          cp $APK_BUILD_DIR/app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+             "apk-out/LocalSend-${{ needs.build.outputs.version }}-noimpeller-arm64-v8a.apk"
+          ls -l apk-out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: apk-noimpeller
+          path: apk-out/*.apk
+
+      - name: Publish APK to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="noimpeller-${{ github.run_number }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "LocalSend ${{ needs.build.outputs.version }} with Impeller disabled (test build)" \
+            --notes "Built from upstream main at ${{ github.sha }}. Identical to the official build except:
+
+          - \`io.flutter.embedding.android.EnableImpeller=false\` in the merged manifest
+          - \`applicationId\` is \`org.localsend.localsend_app.noimpeller\`
+          - signed with a throwaway key, not the release key
+
+          The app label is still \"LocalSend\" and everything else, including the FOSS stripping and \`--split-per-abi\`, matches \`.github/workflows/build_android_apk.yml\`.
+
+          Workaround for the navigation rail that is laid out but never painted on some Android head units." \
+            apk-out/*.apk
