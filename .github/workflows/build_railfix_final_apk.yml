@@ -1,0 +1,178 @@
+name: Build RailFix APK
+
+# Builds installable APKs of the final fix for the "blank navigation rail on car head units" bug.
+#
+# Root cause, established on the affected device by changing one thing at a time:
+#
+#   nothing                                              rail blank
+#   setState once after the first frame                   rail blank
+#   RenderView.markNeedsPaint()                           rail blank
+#   RepaintBoundary around the rail, or around the body    rail blank
+#   an overlay with Opacity(0), which paints nothing       rail blank
+#   an overlay that paints opaque pixels                   rail shown
+#   Impeller disabled, Dart code untouched                 rail shown
+#
+# The rail is laid out and receives taps, but Impeller drops it while compositing the layer tree on this GPU.
+# Any opaque pixel painted anywhere in the tree makes it composite the rail as well. The fix adds exactly one:
+# a 1x1 pixel in the background colour, excluded from hit testing, so it is invisible and untappable.
+#
+# Two APKs are produced:
+#   fix       the fix, for daily use
+#   baseline  the same code without the fix, as a control to confirm the symptom is still reproducible
+#
+# Only arm64-v8a is built, because the 32-bit APK cannot be installed on the affected device.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/rail-paint-primer
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.41.9"
+  APK_BUILD_DIR: "/tmp/build"
+
+jobs:
+  build_apk:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: fix
+            suffix: ".railfix"
+            label: "LocalSend (rail fix)"
+          - variant: baseline
+            suffix: ".railbase"
+            label: "LS baseline (no fix)"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Copy files to env.APK_BUILD_DIR
+        run: |
+          mkdir -p $APK_BUILD_DIR
+          cp -r . $APK_BUILD_DIR
+
+      # The baseline removes the single PaintPrimer call, so that both APKs differ by the fix alone.
+      - name: Remove the fix for the baseline build
+        if: matrix.variant == 'baseline'
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          sed -i '/const PaintPrimer(),/d' app/lib/pages/home_page.dart
+          if grep -q 'PaintPrimer' app/lib/pages/home_page.dart; then
+            echo "::error::PaintPrimer is still referenced"; exit 1
+          fi
+          echo "PaintPrimer removed"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Rust toolchain
+        working-directory: ${{ env.APK_BUILD_DIR }}/packages/localsend_isolates
+        run: |
+          rustup toolchain install --profile minimal
+          rustup show
+
+      - name: Dependencies
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter analyze
+
+      - name: Remove proprietary dependencies
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: sh support/scripts/remove_proprietary_dependencies.sh
+
+      - name: Apply test build identity
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          sed -i 's|applicationId "org.localsend.localsend_app"|applicationId "org.localsend.localsend_app'"${{ matrix.suffix }}"'"|' app/android/app/build.gradle
+          sed -i 's|android:label="LocalSend"|android:label="${{ matrix.label }}"|' app/android/app/src/main/AndroidManifest.xml
+          grep -n 'applicationId ' app/android/app/build.gradle
+          grep -n 'android:label=' app/android/app/src/main/AndroidManifest.xml
+
+      - name: Generate throwaway signing key
+        working-directory: ${{ env.APK_BUILD_DIR }}
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$PWD/railfix.jks" \
+            -storetype PKCS12 \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias railfix \
+            -storepass railfix123 -keypass railfix123 \
+            -dname "CN=LocalSend RailFix Test, OU=RailFix, O=LocalSend, L=Test, ST=Test, C=DE"
+          cat > app/android/key.properties <<EOF
+          storePassword=railfix123
+          keyPassword=railfix123
+          keyAlias=railfix
+          storeFile=$PWD/railfix.jks
+          EOF
+
+      # Official build flags.
+      - name: Build APK
+        working-directory: ${{ env.APK_BUILD_DIR }}/app
+        run: flutter build apk --split-per-abi
+
+      - name: Collect APK
+        run: |
+          mkdir -p apk-out
+          cp $APK_BUILD_DIR/app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+             "apk-out/RailFix-${{ matrix.variant }}-arm64-v8a.apk"
+          ls -l apk-out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: railfix-apk-${{ matrix.variant }}
+          path: apk-out/*.apk
+
+      - name: Save APK for the release job
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-apk-${{ matrix.variant }}
+          path: apk-out/*.apk
+
+  publish:
+    needs: build_apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-apk-*
+          path: apk-out
+          merge-multiple: true
+
+      - name: Publish APKs to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l apk-out
+          TAG="railfix-final-${{ github.run_number }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RailFix ${{ github.run_number }} (final)" \
+            --notes "Fix for the blank navigation rail on car head units, plus a baseline to compare against.
+
+          **RailFix-fix** - the fix: one invisible 1x1 pixel, painted in the background colour.
+          **RailFix-baseline** - the same code with that pixel removed, to confirm the symptom still reproduces.
+
+          Root cause: Impeller drops the rail while compositing the layer tree on this GPU. The rail is still laid out and still receives taps, which is why it looks blank rather than missing. Disabling Impeller also fixes it, but that would cost rendering performance on every device, so the fix is done in the widget tree instead.
+
+          Both APKs install next to the official app." \
+            apk-out/*.apk
